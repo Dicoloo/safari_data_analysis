@@ -1,7 +1,8 @@
 # fresh_safari_analysis.R
 # Robust pipeline to parse "Safari data.pdf" and run EDA + tests + regression.
 # Put this file in the same folder as the PDF or update pdf_file to the correct path.
-
+# download the data used from the drive below.
+##https://drive.google.com/file/d/19VPAV3hTHs7hgsoHJDbwbwsuq9VdZPIp/view?usp=drivesdk
 # 0. Packages (install if missing)
 pkgs <- c("pdftools","stringr","dplyr","ggplot2","broom","car","MASS","ggpubr","readr")
 new <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
