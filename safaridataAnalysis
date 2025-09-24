@@ -1,0 +1,179 @@
+# fresh_safari_analysis.R
+# Robust pipeline to parse "Safari data.pdf" and run EDA + tests + regression.
+# Put this file in the same folder as the PDF or update pdf_file to the correct path.
+
+# 0. Packages (install if missing)
+pkgs <- c("pdftools","stringr","dplyr","ggplot2","broom","car","MASS","ggpubr","readr")
+new <- pkgs[!(pkgs %in% installed.packages()[,"Package"])]
+if(length(new)) install.packages(new, repos="https://cloud.r-project.org")
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# 1. File path (edit if needed)
+pdf_file <- "Safari data.pdf"   # <<-- change to "/mnt/data/Safari data.pdf" if running where file lives
+if(!file.exists(pdf_file)){
+  stop("PDF file not found at path: ", pdf_file, "\nSet pdf_file to the correct path and re-run.")
+}
+
+# 2. Extract text and lines
+txt_pages <- pdftools::pdf_text(pdf_file)
+lines <- unlist(strsplit(txt_pages, "\n"))
+# Quick look to help debugging (shows first 40 lines)
+cat("First 40 raw text lines from PDF:\n")
+cat(paste0(head(lines, 40), collapse = "\n"), "\n\n")
+
+# 3. Parse numeric tokens robustly
+#    - Extract all numbers from each line.
+#    - Keep lines with >= 3 numeric tokens.
+#    - Use the LAST 3 tokens per line (handles stray leading numbers like page/line numbers).
+extract_last3 <- function(line) {
+  toks <- stringr::str_extract_all(line, "-?\\d+\\.?\\d*")[[1]]
+  if(length(toks) >= 3) return(tail(toks, 3)) else return(NULL)
+}
+tokens_list <- lapply(lines, extract_last3)
+tokens_list <- tokens_list[!sapply(tokens_list, is.null)]
+if(length(tokens_list) == 0){
+  stop("No numeric rows detected. The PDF text parser did not find numeric token patterns.")
+}
+mat <- do.call(rbind, lapply(tokens_list, function(x) as.numeric(x)))
+colnames(mat) <- c("V1", "V2", "Group")
+dat <- as.data.frame(mat, stringsAsFactors = FALSE)
+dat$Group <- factor(dat$Group)
+# Basic sanity checks
+cat("Rows parsed:", nrow(dat), "\n")
+cat("Group distribution:\n")
+print(table(dat$Group))
+# Show first few rows
+print(head(dat, 20))
+
+# 4. Clean / filter (optional)
+#    - Remove NA rows
+#    - Remove implausible groups if needed
+dat <- dat %>% filter(!is.na(V1) & !is.na(V2) & !is.na(Group))
+# If your groups are only 1 & 2: keep only those
+if(any(!(levels(dat$Group) %in% c("1","2")))){
+  # convert numeric then filter
+  dat <- dat %>% mutate(Group = factor(as.character(Group))) # keep as-is, but you can filter if necessary
+}
+# Save cleaned CSV
+readr::write_csv(dat, "safari_data_clean.csv")
+cat("Cleaned data saved to safari_data_clean.csv\n\n")
+
+# 5. Exploratory data analysis
+cat("Summary (all):\n")
+print(summary(dat))
+cat("\nSummary by group:\n")
+print(dat %>% group_by(Group) %>% summarise(n = n(),
+                                            V1_mean = mean(V1), V1_sd = sd(V1),
+                                            V2_mean = mean(V2), V2_sd = sd(V2)))
+# Plots (save PNGs)
+p_hist_v1 <- ggplot(dat, aes(x = V1)) + geom_histogram(bins = 30) + ggtitle("Histogram V1")
+p_hist_v2 <- ggplot(dat, aes(x = V2)) + geom_histogram(bins = 30) + ggtitle("Histogram V2")
+p_box_v1  <- ggplot(dat, aes(x = Group, y = V1)) + geom_boxplot() + ggtitle("V1 by Group")
+p_box_v2  <- ggplot(dat, aes(x = Group, y = V2)) + geom_boxplot() + ggtitle("V2 by Group")
+p_scatter <- ggplot(dat, aes(x = V2, y = V1, color = Group)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE) +
+  ggtitle("V1 ~ V2 (colored by Group)")
+
+ggsave("hist_V1.png", p_hist_v1, width = 6, height = 4)
+ggsave("hist_V2.png", p_hist_v2, width = 6, height = 4)
+ggsave("box_V1_by_group.png", p_box_v1, width = 6, height = 4)
+ggsave("box_V2_by_group.png", p_box_v2, width = 6, height = 4)
+ggsave("scatter_V1_V2_by_group.png", p_scatter, width = 7, height = 5)
+cat("Saved plots: hist_V1.png, hist_V2.png, box_V1_by_group.png, box_V2_by_group.png, scatter_V1_V2_by_group.png\n\n")
+
+# 6. Correlation
+cor_all <- cor(dat$V1, dat$V2)
+cor_by_group <- dat %>% group_by(Group) %>% summarise(r = cor(V1, V2))
+cat("Overall Pearson correlation V1 & V2:", round(cor_all, 3), "\n")
+print(cor_by_group)
+
+# 7. Assumption checks (normality, equal variance)
+# Shapiro-Wilk (sample if n > 5000 because SW has limits)
+safe_shapiro <- function(x){
+  if(length(x) > 5000) x <- sample(x, 5000)
+  tryCatch(shapiro.test(x), error = function(e) return(NA))
+}
+sw_v1 <- safe_shapiro(dat$V1)
+sw_v2 <- safe_shapiro(dat$V2)
+cat("\nShapiro results (V1, V2):\n")
+print(sw_v1)
+print(sw_v2)
+# Levene's test for homogeneity (from car)
+levene_v1 <- car::leveneTest(V1 ~ Group, data = dat)
+levene_v2 <- car::leveneTest(V2 ~ Group, data = dat)
+cat("\nLevene tests:\n")
+print(levene_v1)
+print(levene_v2)
+
+
+# 8. Group comparisons
+#    - If two groups -> t-test (Welch)
+#    - If >2 groups -> one-way ANOVA + Tukey
+ngroups <- length(levels(dat$Group))
+if(ngroups == 2){
+  t_v1 <- t.test(V1 ~ Group, data = dat)
+  t_v2 <- t.test(V2 ~ Group, data = dat)
+  cat("\nWelch t-test V1 by Group:\n"); print(t_v1)
+  cat("\nWelch t-test V2 by Group:\n"); print(t_v2)
+} else {
+  aov_v1 <- aov(V1 ~ Group, data = dat)
+  cat("\nANOVA V1 ~ Group:\n"); print(summary(aov_v1))
+  tuk_v1 <- TukeyHSD(aov_v1); print(tuk_v1)
+}
+
+
+# 9. Regression models
+# Simple regression
+lm1 <- lm(V1 ~ V2, data = dat)
+cat("\nLM1 summary (V1 ~ V2):\n"); print(summary(lm1))
+
+# Add Group
+lm2 <- lm(V1 ~ V2 + Group, data = dat)
+cat("\nLM2 summary (V1 ~ V2 + Group):\n"); print(summary(lm2))
+
+# Interaction model
+lm3 <- lm(V1 ~ V2 * Group, data = dat)
+cat("\nLM3 summary (V1 ~ V2 * Group):\n"); print(summary(lm3))
+
+# Save tidy summaries
+readr::write_csv(broom::tidy(lm3), "lm3_coefficients.csv")
+cat("Saved lm3 coefficients to lm3_coefficients.csv\n")
+
+# 10. Model diagnostics (lm3)
+# Save base R diagnostic plot to PNG
+png("lm3_diagnostic_plots.png", width = 1200, height = 1000)
+par(mfrow = c(2,2))
+plot(lm3)
+dev.off()
+cat("Saved lm3 diagnostic plots to lm3_diagnostic_plots.png\n")
+
+# Cook's distances
+cooks <- cooks.distance(lm3)
+influential_idx <- which(cooks > (4/length(cooks)))
+cat("Influential indices (Cook's D > 4/n):\n"); print(influential_idx)
+readr::write_csv(data.frame(index = seq_along(cooks), cooks = cooks),
+                 "lm3_cooks_distances.csv")
+cat("Saved cook's distances to lm3_cooks_distances.csv\n")
+
+# VIF (check multicollinearity)
+vif_vals <- tryCatch(car::vif(lm3), error = function(e) NA)
+cat("VIFs (if available):\n"); print(vif_vals)
+
+# 11. Robust regression (M-estimator)
+rlm_fit <- MASS::rlm(V1 ~ V2 * Group, data = dat)
+cat("\nRobust regression (rlm) summary:\n"); print(summary(rlm_fit))
+
+# 12. Quick automated report (text)
+report_lines <- c(
+  paste0("Parsed rows: ", nrow(dat)),
+  paste0("Group counts: ", paste(names(table(dat$Group)), table(dat$Group), collapse = "; ")),
+  paste0("Overall cor(V1,V2): ", round(cor_all, 3)),
+  "",
+  "LM3 coefficients saved at lm3_coefficients.csv",
+  "Diagnostic PNG at lm3_diagnostic_plots.png"
+)
+writeLines(report_lines, "quick_report.txt")
+cat("Quick report written to quick_report.txt\n")
+
+cat("- safari_data_clean.csv\n- hist_V1.png, hist_V2.png\n- box and scatter plots\n- lm3_coefficients.csv\n- lm3_diagnostic_plots.png\n- lm3_cooks_distances.csv\n- quick_report.txt\n")
